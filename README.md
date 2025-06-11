@@ -102,3 +102,7 @@ Look for underpriced players based on their roles or positions:
 ---
 
 *Built using Moneyball principles and years of FPL experience.*
+
+
+Current Team
+![image](https://github.com/user-attachments/assets/69fed81a-be6f-4111-bc4e-7d70a17aefe3)
