@@ -3,6 +3,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import matplotlib.pyplot as plt
+import os
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain_google_genai import GoogleGenerativeAI
+
 
 def load_fpl_data():
     """Fetch data from FPL API and return player and position dataframes."""
@@ -243,3 +248,73 @@ def optimize_fpl_team(players_df, players_to_keep=None, players_to_exclude=None)
     selected_players = players_df.loc[players_df['selected'].apply(lambda var: var.varValue == 1), 'name'].tolist()
 
     return selected_players, model
+
+
+from langchain_community.utilities import GoogleSearchAPIWrapper
+def fpl_langchain_advisor(question: str, my_team_df) -> str:
+    """Use LLM to analyze your current FPL team and answer the question."""
+
+    # Set environment variables for LangChain and Google API
+    os.environ['LANGCHAIN_TRACING_V2'] = 'true'
+    os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
+    os.environ['LANGCHAIN_API_KEY'] = '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'
+    os.environ['GOOGLE_API_KEY'] = 'AIzaSyC3mD-iVxmgexEwdNjR0MqFfdhyBpLnApY'
+
+    # Select relevant columns from your FPL team DataFrame
+    subset = my_team_df[['name', 'position', 'total_points', 'now_cost', 'minutes', 'form', 'selected_by_percent']]
+    team_data_str = subset.to_csv(index=False)
+
+    # Create prompt
+    template = PromptTemplate(
+        input_variables=["question", "team_data"],
+        template="""
+You are a top-tier Fantasy Premier League (FPL) expert.
+
+Below is data about my FPL team:
+
+{team_data}
+
+Using this data, answer the following question:
+
+{question}
+
+Provide specific advice using the stats. Consider form, minutes played, cost, and ownership.
+"""
+    )
+
+    # Use Gemini Flash model
+    llm = GoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.3)
+    chain = LLMChain(llm=llm, prompt=template)
+
+    # Run the chain
+    response = chain.run({
+        "question": question,
+        "team_data": team_data_str
+    })
+
+    return response
+
+def get_fpl_injury_news():
+    # Set environment variables for LangChain and Google API
+    os.environ['LANGCHAIN_TRACING_V2'] = 'true'
+    os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
+    os.environ['LANGCHAIN_API_KEY'] = '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'
+    os.environ['GOOGLE_API_KEY'] = 'AIzaSyC3mD-iVxmgexEwdNjR0MqFfdhyBpLnApY'
+    # 1. Search the latest news
+    search = GoogleSearchAPIWrapper()
+    results = search.run("Fantasy Premier League injury news site:fantasyfootballscout.co.uk OR premierleague.com")
+
+    # 2. Prompt LLM to summarize
+    llm = GoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.3)
+    prompt = PromptTemplate(
+        input_variables=["news"],
+        template="""
+You're a Fantasy Premier League advisor. Summarize the latest injury and team news from the content below for this Gameweek:
+
+{news}
+"""
+    )
+    chain = LLMChain(llm=llm, prompt=prompt)
+    summary = chain.run(news=results)
+    return summary
+
