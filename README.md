@@ -1,3 +1,6 @@
+15 Dece - added match difficulties to the projected point, captain + vice-captain selection, best 11 selection
+
+
 # 🏆 Fantasy Premier League (FPL) Strategy Guide — Moneyball Edition
 
 Building a successful Premier League Fantasy Football (FPL) team involves balancing value, fixtures, form, rotation, and long-term planning. This guide provides a data-driven, strategic approach to help you manage your team like a pro—or a Moneyball manager.
