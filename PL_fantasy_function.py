@@ -25,7 +25,7 @@ pl.plot_cumulative_points(
 players_df = pl.fetch_and_forecast_players()
 
 # Optional filters for players to definitely include or exclude
-players_to_keep = ['Erling Haaland', 'Alexander Isak']
+players_to_keep = []#['Erling Haaland']
 players_to_exclude = []  # Add player names if any should be avoided
 
 # Get the optimized team
@@ -36,23 +36,38 @@ selected_players, model = pl.optimize_fpl_team(
 )
 
 # Print the optimized FPL team
-print("⚽ Optimized team:", selected_players)
+print("⚽ Optimized 15-player squad:", selected_players)
+print("-" * 30)
 
+#%%
+# --- NEW ADDITION: Optimize the Starting 11 ---
+# Filter the original players_df to only include the 15 selected players
+squad_df = players_df[players_df['name'].isin(selected_players)].copy()
+
+# Get the optimized Starting 11 from the squad
+starting_11 = pl.optimize_starting_11(squad_df)
+
+# Print the Optimized Starting 11
+
+print('total cost: ', starting_11['now_cost'].sum())
+
+print("🌟 Optimized Starting 11:")
+starting_11.head(11)
 #%% 4. Query model using LangChain assistant
 # Ask questions in natural language, and the assistant will respond based on the player data
 #players_df['selected'] = players_df['selected'].replace('_', ' ')  # Replace underscores with spaces for better readability
-my_team_df = players_df[players_df['name'].isin(selected_players)]
-q = "Question 1: Who should be captain for my team? \
-Question 2: Should I use Wildcards & Chips for next week?" \
-
-response = pl.fpl_langchain_advisor(q, my_team_df)
-print("🤖 Advisor Response:", response)
+#my_team_df = players_df[players_df['name'].isin(selected_players)]
+#q = "Question 1: Who should be captain for my team? \
+#Question 2: Should I use Wildcards & Chips for next week?" \
+#
+#response = pl.fpl_langchain_advisor(q, my_team_df)
+#print("🤖 Advisor Response:", response)
 
 
 #%% 5. Get FPL injury news
 # Fetch the latest injury news for players in the FPL
-news = pl.get_fpl_injury_news()
-print(news)
+#news = pl.get_fpl_injury_news()
+#print(news)
 #%%
 # [OPTIONAL] Manual Moneyball-style filtering (Commented Out)
 # This block manually calculates Points Per Million (PPM) and Points per 90 minutes
