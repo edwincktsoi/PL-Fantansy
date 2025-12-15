@@ -1,34 +1,55 @@
+import os
 import requests
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 import matplotlib.pyplot as plt
-import os
+from tqdm import tqdm
+from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpStatus
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain_google_genai import GoogleGenerativeAI
-import pandas as pd
-from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpStatus
+from langchain_community.utilities import GoogleSearchAPIWrapper
+
+# --- Constants ---
+FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
+DIFFICULTY_MULTIPLIER = {
+    1: 1.20,  # Very Easy: +20%
+    2: 1.10,  # Easy: +10%
+    3: 1.00,  # Average: No change
+    4: 0.85,  # Hard: -15%
+    5: 0.70   # Very Hard: -30%
+}
+POSITION_MAP = {1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'}
+
+# Suppress ChainedAssignment warnings
+pd.options.mode.chained_assignment = None 
 
 def load_fpl_data():
     """Fetch data from FPL API and return player and position dataframes."""
-    url = "https://fantasy.premierleague.com/api/bootstrap-static/"
+    url = f"{FPL_BASE_URL}bootstrap-static/"
     data = requests.get(url).json()
+    
     players_df = pd.DataFrame(data['elements'])
     positions_df = pd.DataFrame(data['element_types'])
+    
+    # Map positions
     players_df['position'] = players_df['element_type'].map(positions_df.set_index('id')['singular_name'])
+    
+    # Calculate Age
     players_df['birth_date'] = pd.to_datetime(players_df['birth_date'], errors='coerce')
-    today = pd.to_datetime('today')
-    players_df['age'] = (today - players_df['birth_date']).dt.days // 365
+    players_df['age'] = (pd.Timestamp.now() - players_df['birth_date']).dt.days // 365
+    
     return players_df, positions_df
 
 def plot_points_vs_cost(players_df, positions_df):
-    """Plot total FPL points vs cost for each position using scatter plots with trendlines."""
-    players_df = players_df.copy()
-    players_df['cost_m'] = players_df['now_cost'] / 10
+    """Plot total FPL points vs cost for each position."""
+    df = players_df.copy()
+    df['cost_m'] = df['now_cost'] / 10
 
-    for pos in players_df['position'].unique():
-        subset = players_df[players_df['position'] == pos]
+    for pos in df['position'].unique():
+        subset = df[df['position'] == pos]
         fig = px.scatter(
             subset,
             x='cost_m',
@@ -42,29 +63,43 @@ def plot_points_vs_cost(players_df, positions_df):
         fig.show()
 
 def plot_cumulative_points(age_limit=26, position='Midfielder', min_cum_points=50):
-    """Plot cumulative points over gameweeks for players under given age and above a point threshold."""
+    """Plot cumulative points history for specific player demographics."""
     players_df, _ = load_fpl_data()
     filtered = players_df[(players_df['position'] == position) & (players_df['age'] < age_limit)]
 
+    if filtered.empty:
+        print(f"No players found for position {position} under age {age_limit}.")
+        return
+
     all_history = []
-    for _, player in filtered.iterrows():
-        url = f"https://fantasy.premierleague.com/api/element-summary/{player['id']}/"
-        history = requests.get(url).json().get('history', [])
-        if history:
-            df = pd.DataFrame(history)
-            df['player_name'] = player['web_name']
-            all_history.append(df)
+    
+    # Use Session for faster repeated requests
+    with requests.Session() as session:
+        for _, player in tqdm(filtered.iterrows(), total=filtered.shape[0], desc="Fetching History"):
+            try:
+                url = f"{FPL_BASE_URL}element-summary/{player['id']}/"
+                resp = session.get(url)
+                if resp.status_code == 200:
+                    history = resp.json().get('history', [])
+                    if history:
+                        df = pd.DataFrame(history)
+                        df['player_name'] = player['web_name']
+                        all_history.append(df)
+            except Exception:
+                continue
 
     if not all_history:
-        print("No player data found.")
+        print("No historical data available.")
         return
 
     df_history = pd.concat(all_history)
     fig = go.Figure()
 
+    # Create traces only for players meeting the point threshold
     for name in df_history['player_name'].unique():
         player_data = df_history[df_history['player_name'] == name].sort_values('round')
         player_data['cumulative_points'] = player_data['total_points'].cumsum()
+        
         if player_data['cumulative_points'].max() >= min_cum_points:
             fig.add_trace(go.Scatter(
                 x=player_data['round'],
@@ -81,437 +116,370 @@ def plot_cumulative_points(age_limit=26, position='Midfielder', min_cum_points=5
     )
     fig.show()
 
-
-import requests
-import pandas as pd
-from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpStatus
-from tqdm import tqdm
-
-import requests
-import pandas as pd
-from tqdm import tqdm
-
 def fetch_and_forecast_players():
     """
     Fetches FPL players, calculates form from last 3 GWs, 
     and adjusts projected points based on upcoming fixture difficulty.
     """
-    base_url = "https://fantasy.premierleague.com/api/"
-    
-    # 1. Fetch Bootstrap Data
     print("Fetching bootstrap data...")
-    bootstrap = requests.get(base_url + "bootstrap-static/").json()
+    bootstrap = requests.get(f"{FPL_BASE_URL}bootstrap-static/").json()
     players_df = pd.DataFrame(bootstrap['elements'])
     events_df = pd.DataFrame(bootstrap['events'])
     
-    # Identify the NEXT Gameweek
+    # Identify Next Gameweek
     next_event = events_df[events_df['is_next'] == True]
-    if not next_event.empty:
-        next_gw_id = next_event.iloc[0]['id']
-        print(f"Next Gameweek is: GW{next_gw_id}")
-    else:
-        print("Season finished or no next GW found. Defaulting to GW 38.")
-        next_gw_id = 38
+    next_gw_id = next_event.iloc[0]['id'] if not next_event.empty else 38
+    print(f"Forecasting for GW{next_gw_id}...")
 
-    # 2. Define Difficulty Discount Factors (The "Multiplier")
-    # 1 (Easy) -> Boost points | 5 (Hard) -> Reduce points
-    difficulty_multiplier = {
-        1: 1.20,  # Very Easy: +20%
-        2: 1.10,  # Easy: +10%
-        3: 1.00,  # Average: No change
-        4: 0.85,  # Hard: -15%
-        5: 0.70   # Very Hard: -30%
-    }
-
-    # 3. Fetch Fixtures for the Next Gameweek
-    print(f"Fetching fixtures for GW{next_gw_id}...")
-    fixtures = requests.get(base_url + "fixtures/").json()
+    # Calculate Team Difficulty Multipliers
+    print("Fetching fixtures...")
+    fixtures = requests.get(f"{FPL_BASE_URL}fixtures/").json()
     
-    # Initialize a map for team multipliers (Default 0.0 for Blank GWs)
-    # Bench value for Blank Gameweeks (player still has some value)
-    BENCH_MULTIPLIER = 0.30
-    # 20 teams, indexed by ID (1-20)
-    team_multipliers = {i: BENCH_MULTIPLIER for i in range(1, 21)}
+    # Initialize multipliers (Default 0.30 for blank GWs)
+    team_multipliers = {i: 0.30 for i in range(1, 21)}
     
-    # Process fixtures to build the multiplier map
-    # This automatically handles Double Gameweeks (adds both games) and Blanks (stays 0)
     for f in fixtures:
         if f['event'] == next_gw_id:
-            h_team = f['team_h']
-            a_team = f['team_a']
-            h_diff = f['team_h_difficulty']
-            a_diff = f['team_a_difficulty']
-            
-            # Add multiplier for Home Team
-            team_multipliers[h_team] += difficulty_multiplier.get(h_diff, 1.0)
-            
-            # Add multiplier for Away Team
-            team_multipliers[a_team] += difficulty_multiplier.get(a_diff, 1.0)
+            # Add difficulty multiplier (Handles Double GWs automatically)
+            team_multipliers[f['team_h']] += DIFFICULTY_MULTIPLIER.get(f['team_h_difficulty'], 1.0)
+            team_multipliers[f['team_a']] += DIFFICULTY_MULTIPLIER.get(f['team_a_difficulty'], 1.0)
 
-    # 4. Process Player Data
-    # Keep only key fields
-    players_df = players_df[[
-        'id', 'first_name', 'second_name', 'team', 'element_type',
-        'now_cost', 'minutes', 'selected_by_percent',
-        'total_points', 'expected_goals', 'expected_assists',
-        'form', 'points_per_game', 'in_dreamteam', 'chance_of_playing_this_round'
-    ]]
-
+    # Filter and Prep Player Data
     players_df['name'] = players_df['first_name'] + ' ' + players_df['second_name']
     
-    # Filter for active players
-    # Use fillna(100) because "None" often means fully fit in FPL API
+    # Clean chance_of_playing (None usually means 100%)
     players_df['chance_of_playing_this_round'] = players_df['chance_of_playing_this_round'].fillna(100)
     players_df = players_df[players_df['chance_of_playing_this_round'] > 70]
 
-    # 5. Fetch Recent Form (Last 3 GWs)
+    # Fetch Recent History (Last 3 GWs)
+    relevant_players = players_df[players_df['total_points'] >= 10]['id'].tolist()
     all_recent_points = []
     
-    # Optimization: Only fetch history for relevant players to save time
-    # (e.g. players with > 10 total points or cost > 4.0)
-    relevant_players = players_df[players_df['total_points'] >= 10]['id'].tolist()
-    
-    print(f"Fetching history for {len(relevant_players)} players...")
-    
-    # Using a session for faster connection reuse
+    print(f"Fetching history for {len(relevant_players)} active players...")
     with requests.Session() as session:
-        for player_id in tqdm(relevant_players, desc="Fetching GW history"):
+        for player_id in tqdm(relevant_players, desc="Processing Players"):
             try:
-                res = session.get(f"{base_url}element-summary/{player_id}/")
-                if res.status_code != 200: continue
-                
-                history = res.json().get('history', [])
-                last_3 = history[-3:] if len(history) >= 3 else history
-                
-                # If player has no history, skip
-                if not last_3: continue
-                
-                for i, gw in enumerate(reversed(last_3)):
-                    all_recent_points.append({
-                        'player_id': player_id,
-                        'gw_rank': i + 1, # 1 = most recent
-                        'total_points': gw['total_points']
-                    })
+                res = session.get(f"{FPL_BASE_URL}element-summary/{player_id}/")
+                if res.status_code == 200:
+                    history = res.json().get('history', [])
+                    last_3 = history[-3:] if len(history) >= 3 else history
+                    
+                    if last_3:
+                        for i, gw in enumerate(reversed(last_3)):
+                            all_recent_points.append({
+                                'player_id': player_id,
+                                'gw_rank': i + 1, # 1 = most recent
+                                'total_points': gw['total_points']
+                            })
             except Exception:
                 continue
 
-    history_df = pd.DataFrame(all_recent_points)
-    
-    if not history_df.empty:
+    # Merge History
+    if all_recent_points:
+        history_df = pd.DataFrame(all_recent_points)
         pivot = history_df.pivot(index='player_id', columns='gw_rank', values='total_points')
         pivot.columns = [f'gw_{col}_points' for col in pivot.columns]
-        pivot = pivot.reset_index()
-        players_df = players_df.merge(pivot, left_on='id', right_on='player_id', how='left')
-    else:
-        # Fallback if history fetch fails or season just started
-        for col in ['gw_1_points', 'gw_2_points', 'gw_3_points']:
-            players_df[col] = 0
-
-    # Fill NaN history with 0
-    for col in ['gw_1_points', 'gw_2_points', 'gw_3_points']:
-        if col in players_df.columns:
-            players_df[col] = players_df[col].fillna(0)
-        else:
-            players_df[col] = 0
-
-    # 6. Calculate Base Form Points (Weighted)
-    players_df['base_form_points'] = (
-        0.45 * players_df['gw_1_points'] +  # 50% weight to most recent
-        0.35 * players_df['gw_2_points'] +  # 30% weight to 2nd recent
-        0.2 * players_df['gw_3_points']    # 20% weight to 3rd recent
-    )
-
-    # 7. Apply Fixture Difficulty Discount/Boost
-    # Map team ID to the multiplier we calculated earlier
-    players_df['fixture_multiplier'] = players_df['team'].map(team_multipliers)
+        players_df = players_df.merge(pivot, left_on='id', right_index=True, how='left')
     
-    # Final Projection Formula
-    players_df['projected_points'] = players_df['base_form_points'] * players_df['fixture_multiplier']
+    # Fill missing history with 0
+    for col in ['gw_1_points', 'gw_2_points', 'gw_3_points']:
+        if col not in players_df.columns:
+            players_df[col] = 0
+        players_df[col] = players_df[col].fillna(0)
 
-    # Handle Cost
+    # Calculate Projection
+    players_df['base_form_points'] = (
+        0.45 * players_df['gw_1_points'] + 
+        0.35 * players_df['gw_2_points'] + 
+        0.20 * players_df['gw_3_points']
+    )
+    
+    players_df['fixture_multiplier'] = players_df['team'].map(team_multipliers)
+    players_df['projected_points'] = players_df['base_form_points'] * players_df['fixture_multiplier']
     players_df['now_cost'] = players_df['now_cost'] / 10
 
-    # Clean up columns
-    final_df = players_df.sort_values(by='projected_points', ascending=False)
-    
-    return final_df
-
+    return players_df.sort_values(by='projected_points', ascending=False)
 
 def optimize_fpl_team(players_df, players_to_keep=None, players_to_exclude=None):
-    if players_to_keep is None:
-        players_to_keep = []
-    if players_to_exclude is None:
-        players_to_exclude = []
+    """Runs Linear Programming to select the best 15-man squad."""
+    players_to_keep = players_to_keep or []
+    players_to_exclude = players_to_exclude or []
 
-    # Create binary decision variables for each player
-    players_df['selected'] = players_df['name'].apply(lambda name: LpVariable(name, cat='Binary'))
+    # Setup Variables
+    players_df['selected'] = players_df['name'].apply(lambda name: LpVariable(name.replace(" ", "_"), cat='Binary'))
+    model = LpProblem("FPL_Squad_Optimizer", LpMaximize)
 
-    # Initialize LP problem
-    model = LpProblem("FPL_Team_Optimizer", LpMaximize)
-
-    # Objective: maximize projected points
+    # Objective: Maximize Projected Points
     model += lpSum(players_df['selected'] * players_df['projected_points'])
 
     # Constraints
-    model += lpSum(players_df['selected'] * players_df['now_cost']) <= 100  # Budget
-    model += lpSum(players_df['selected']) == 15  # Squad size
+    model += lpSum(players_df['selected'] * players_df['now_cost']) <= 100.0, "Budget"
+    model += lpSum(players_df['selected']) == 15, "Squad_Size"
 
-    # Position constraints
-    position_counts = {1: 2, 2: 5, 3: 5, 4: 3}  # GKP, DEF, MID, FWD
-    for pos, count in position_counts.items():
-        model += lpSum(players_df.loc[players_df['element_type'] == pos, 'selected']) == count
+    # Positional Constraints
+    for pos, count in {1: 2, 2: 5, 3: 5, 4: 3}.items():
+        model += lpSum(players_df.loc[players_df['element_type'] == pos, 'selected']) == count, f"Pos_{pos}_Count"
 
     # Max 3 players per team
     for team_id in players_df['team'].unique():
         model += lpSum(players_df.loc[players_df['team'] == team_id, 'selected']) <= 3
 
-    # Keep specified players
-    for player_name in players_to_keep:
-        if player_name in players_df['name'].values:
-            model += players_df.loc[players_df['name'] == player_name, 'selected'].values[0] == 1
+    # Forced Keep/Exclude
+    for name in players_to_keep:
+        if name in players_df['name'].values:
+            model += players_df.loc[players_df['name'] == name, 'selected'].values[0] == 1
+    for name in players_to_exclude:
+        if name in players_df['name'].values:
+            model += players_df.loc[players_df['name'] == name, 'selected'].values[0] == 0
 
-    # Exclude specified players
-    for player_name in players_to_exclude:
-        if player_name in players_df['name'].values:
-            model += players_df.loc[players_df['name'] == player_name, 'selected'].values[0] == 0
-
-    # Position-wise budget constraints (optional, can be adjusted)
-    budget_constraints = {
-        1: (8.0, 8.5),
-        2: (25.0, 26.5),
-        3: (36.0, 38.0),
-        4: (27.0, 29.0),
-    }
-    for pos, (min_budget, max_budget) in budget_constraints.items():
-        pos_players = players_df[players_df['element_type'] == pos]
-        total_cost = lpSum(pos_players['selected'] * pos_players['now_cost'])
-        model += total_cost >= min_budget
-        model += total_cost <= max_budget
-
-    # Solve
     model.solve()
+    print("Optimization Status:", LpStatus[model.status])
 
-    print("Status:", LpStatus[model.status])
-    # Map positions
-    position_map = {1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'}
-    players_df['position'] = players_df['element_type'].map(position_map)
-    selected = players_df[players_df['selected'].apply(lambda var: var.varValue == 1)].copy()
-    unselected = players_df[players_df['selected'].apply(lambda var: var.varValue == 0)].copy()
+    # Extract Results
+    players_df['is_picked'] = players_df['selected'].apply(lambda var: var.varValue)
+    selected_df = players_df[players_df['is_picked'] == 1].copy()
     
-    # Define colors for selected player positions
-    colors = {'GKP': 'blue', 'DEF': 'green', 'MID': 'orange', 'FWD': 'purple'}
+    _plot_optimization_results(players_df, selected_df)
     
-    # Filter valid players (exclude 0 projected points and extreme low-cost)
-    valid_players = players_df[ (players_df['now_cost'] > 2)]
-    
-    # Calculate average cost and points
-    avg_cost = valid_players['now_cost'].mean()
-    avg_points = valid_players['projected_points'].mean()
-    
-    plt.figure(figsize=(12, 7))
-    
-    # Plot unselected players in light gray
-    plt.scatter(unselected['now_cost'], unselected['projected_points'],
-                color='lightgray', alpha=0.5, label='Unselected Players')
-    
-    # Plot selected players by position with annotations
-    for pos, color in colors.items():
-        subset = selected[selected['position'] == pos]
-        plt.scatter(subset['now_cost'], subset['projected_points'],
-                    color=color, label=pos, s=100, edgecolor='black', zorder=3)
-        for _, row in subset.iterrows():
-            plt.text(row['now_cost'] + 0.1, row['projected_points'], row['name'],
-                     fontsize=8, zorder=4)
-    
-    # Draw average lines
-    #plt.axvline(avg_cost, color='darkblue', linestyle='--', linewidth=2,
-    #            label=f'Avg Cost ≈ {avg_cost:.2f}')
-    #plt.axhline(avg_points, color='darkred', linestyle='--', linewidth=2,
-    #            label=f'Avg Projected Points ≈ {avg_points:.2f}')
-    
-    plt.xlabel('Player Cost (now_cost)')
-    plt.ylabel('Projected Points')
-    plt.title('FPL Team Selection: Projected Points vs Cost')
-    plt.legend(title='Selected Positions & Averages')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    return selected_df['name'].tolist(), model
 
+# In pl.py
 
-    selected_players = players_df.loc[players_df['selected'].apply(lambda var: var.varValue == 1), 'name'].tolist()
+#def _plot_optimization_results(all_players, selected_players):
+#    """Helper function to visualize the optimization results."""
+#    
+#    # ISSUE: 'position_name' was only created on 'all_players' (which is players_df)
+#    # SOLUTION: Apply the position map to the selected_players DataFrame directly.
+#    
+#    # 1. Map Position Names to BOTH DataFrames (or at least the one being filtered)
+#    all_players['position_name'] = all_players['element_type'].map(POSITION_MAP)
+#    
+#    # Apply the same mapping to the selected_players DataFrame to ensure the column exists
+#    selected_players['position_name'] = selected_players['element_type'].map(POSITION_MAP) 
+#    
+#    colors = {'GKP': 'blue', 'DEF': 'green', 'MID': 'orange', 'FWD': 'purple'}
+#    
+#    plt.figure(figsize=(12, 7))
+#    
+#    # Plot unselected
+#    unselected = all_players[all_players['is_picked'] == 0]
+#    plt.scatter(unselected['now_cost'], unselected['projected_points'], 
+#                color='lightgray', alpha=0.5, label='Pool')
+#
+#    # Plot selected
+#    for pos, color in colors.items():
+#        # This line now works because 'position_name' exists on 'selected_players'
+#        subset = selected_players[selected_players['position_name'] == pos] 
+#        plt.scatter(subset['now_cost'], subset['projected_points'], 
+#                    color=color, label=pos, s=100, edgecolor='black', zorder=3)
+#        for _, row in subset.iterrows():
+#            plt.text(row['now_cost'], row['projected_points'] + 0.2, 
+#                     row['name'], fontsize=8, ha='center')
+#
+#    plt.xlabel('Cost (£m)')
+#    plt.ylabel('Projected Points')
+#    plt.title('Optimized Squad Selection')
+#    plt.legend()
+#    plt.grid(True, alpha=0.3)
+#    plt.tight_layout()
+#    plt.show()
 
-    return selected_players, model
+# In pl.py, replace the existing _plot_optimization_results function
+import plotly.express as px
+import numpy as np
 
+def _plot_optimization_results(all_players, selected_players):
+    """
+    Optimized Plotly visualization for FPL squad optimization.
+    Selected players are highlighted by position; unselected pool is subtle.
+    """
 
-from langchain_community.utilities import GoogleSearchAPIWrapper
+    # --- Constants ---
+    POSITION_MAP = {1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'}
+    CATEGORY_ORDER = ['GKP', 'DEF', 'MID', 'FWD', 'Unselected Pool']
+
+    COLOR_MAP = {
+        'GKP': 'deepskyblue',
+        'DEF': 'green',
+        'MID': 'gold',
+        'FWD': 'red',
+        'Unselected Pool': 'lightgrey'
+    }
+
+    SIZE_MAP = {
+        'GKP': 6,
+        'DEF': 6,
+        'MID': 6,
+        'FWD': 6,
+        'Unselected Pool': 3
+    }
+
+    # --- Work on a copy (avoid side effects) ---
+    df = all_players.copy()
+
+    # --- Vectorized feature engineering ---
+    df['position_name'] = df['element_type'].map(POSITION_MAP)
+
+    df['is_selected_status'] = np.where(
+        df['is_picked'] == 1,
+        df['position_name'],
+        'Unselected Pool'
+    )
+
+    df['marker_size'] = df['is_selected_status'].map(SIZE_MAP)
+
+    # --- Plot ---
+    fig = px.scatter(
+        df,
+        x='now_cost',
+        y='projected_points',
+        color='is_selected_status',
+        size='marker_size',
+        size_max=8,
+        color_discrete_map=COLOR_MAP,
+        category_orders={'is_selected_status': CATEGORY_ORDER},
+        hover_name='name',
+        hover_data={
+            'now_cost': ':.1f',
+            'projected_points': ':.1f',
+            'team': True,
+            'total_points': True,
+            'form': ':.1f',
+            'position_name': False,
+            'marker_size': False
+        },
+        labels={
+            'now_cost': 'Cost (£m)',
+            'projected_points': 'Projected Points (Next GW)',
+            'is_selected_status': 'Squad Status'
+        },
+        title='Optimized Squad Selection: Cost vs Projected Points'
+    )
+
+    # --- Opacity tuning ---
+    fig.update_traces(
+        opacity=0.35,
+        selector=dict(name='Unselected Pool')
+    )
+
+    fig.update_traces(
+        opacity=1.0,
+        selector=lambda t: t.name != 'Unselected Pool'
+    )
+
+    # --- Layout polish ---
+    fig.update_layout(
+        hovermode='closest',
+        legend_title_text='Selection',
+        xaxis=dict(range=[3.5, 20]),
+        template='plotly_white'
+    )
+
+    fig.show()
+
+# -----------------------------------------------------------
+
+def optimize_starting_11(squad_df: pd.DataFrame) -> pd.DataFrame:
+    """Optimizes Starting XI from the selected 15-man squad."""
+    if len(squad_df) != 15:
+        print(f"Warning: Squad has {len(squad_df)} players. Optimization requires 15.")
+        return pd.DataFrame()
+
+    squad_df['starter'] = squad_df['name'].apply(lambda name: LpVariable(f"starter_{name.replace(' ','_')}", cat='Binary'))
+    model = LpProblem("FPL_Starting_XI", LpMaximize)
+
+    # Objective
+    model += lpSum(squad_df['starter'] * squad_df['projected_points'])
+
+    # Constraints
+    model += lpSum(squad_df['starter']) == 11
+    model += lpSum(squad_df[squad_df['element_type'] == 1]['starter']) == 1  # GKP
+    
+    # Flexible formation constraints
+    # Def: 3-5, Mid: 2-5, Fwd: 1-3
+    for pos, min_c, max_c in [(2, 3, 5), (3, 2, 5), (4, 1, 3)]:
+        starters = squad_df[squad_df['element_type'] == pos]['starter']
+        model += lpSum(starters) >= min_c
+        model += lpSum(starters) <= max_c
+
+    model.solve()
+    
+    # Process Results
+    squad_df['is_starter'] = squad_df['starter'].apply(lambda x: x.varValue)
+    POSITION_MAP = {1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'}
+    squad_df['position_name'] = squad_df['element_type'].map(POSITION_MAP)
+    
+    starters_df = squad_df[squad_df['is_starter'] == 1].copy()
+    
+    # Captaincy
+    starters_df = starters_df.sort_values(by='projected_points', ascending=False)
+    starters_df['role'] = 'Starter'
+    if len(starters_df) >= 2:
+        starters_df.iloc[0, starters_df.columns.get_loc('role')] = 'Captain (C)'
+        starters_df.iloc[1, starters_df.columns.get_loc('role')] = 'Vice-Captain (VC)'
+
+    # Sort by position for display (GKP -> FWD)
+    starters_df = starters_df.sort_values(by=['element_type', 'projected_points'], ascending=[True, False])
+
+    return starters_df[[
+    'name', 
+    'position_name',           # Position (e.g., Goalkeeper, Defender)
+    'role',               # Role (Captain, Vice-Captain, Starter)
+    'team',               # Club
+    'now_cost',
+    'selected_by_percent',            # Price (£m)
+    'projected_points',   # The single most important column for prediction
+    'fixture_multiplier', # The factor used to adjust the points (context for projection)
+    'form',               # Official FPL form score (last 5 GWs)
+    'points_per_game',    # Consistency metric
+    'total_points',       # Season total points
+    'gw_1_points',        # Points from most recent GW (Crucial for form)
+    'gw_2_points',        # Points from 2nd most recent GW
+    'gw_3_points',        # Points from 3rd most recent GW
+    'chance_of_playing_this_round', # Injury/Suspension risk (100 is best)
+
+]]
+
+# --- AI / LLM Features ---
+# Ensure you set these keys in your environment variables before running!
+def _check_api_keys():
+    if not os.environ.get("GOOGLE_API_KEY"):
+        print("⚠️ Warning: GOOGLE_API_KEY not found in environment variables.")
+        return False
+    return True
+
 def fpl_langchain_advisor(question: str, my_team_df) -> str:
-    """Use LLM to analyze your current FPL team and answer the question."""
+    """Analyze team using Gemini."""
+    if not _check_api_keys(): return "API Keys missing."
 
-    # Set environment variables for LangChain and Google API
-    os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-    os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
-    os.environ['LANGCHAIN_API_KEY'] = ''
-    os.environ['GOOGLE_API_KEY'] = ''
-
-    # Select relevant columns from your FPL team DataFrame
-    subset = my_team_df[['name', 'position', 'total_points', 'now_cost', 'minutes', 'form', 'selected_by_percent']]
-    team_data_str = subset.to_csv(index=False)
-
-    # Create prompt
+    subset = my_team_df[['name', 'total_points', 'now_cost', 'minutes', 'form']].to_csv(index=False)
+    
     template = PromptTemplate(
         input_variables=["question", "team_data"],
         template="""
-You are a top-tier Fantasy Premier League (FPL) expert.
-
-Below is data about my FPL team:
-
-{team_data}
-
-Using this data, answer the following question:
-
-{question}
-
-Provide specific advice using the stats. Consider form, minutes played, cost, and ownership.
-"""
+        You are an FPL expert. Given this team data:
+        {team_data}
+        
+        Answer this question: {question}
+        Provide concise, data-backed advice.
+        """
     )
-
-    # Use Gemini Flash model
-    llm = GoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.3)
+    
+    llm = GoogleGenerativeAI(model="gemini-pro", temperature=0.3)
     chain = LLMChain(llm=llm, prompt=template)
-
-    # Run the chain
-    response = chain.run({
-        "question": question,
-        "team_data": team_data_str
-    })
-
-    return response
+    return chain.run({"question": question, "team_data": subset})
 
 def get_fpl_injury_news():
-    # Set environment variables for LangChain and Google API
-    os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-    os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
-    os.environ['LANGCHAIN_API_KEY'] = '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'
-    os.environ['GOOGLE_API_KEY'] = 'AIzaSyC3mD-iVxmgexEwdNjR0MqFfdhyBpLnApY'
-    # 1. Search the latest news
-    search = GoogleSearchAPIWrapper()
-    results = search.run("Fantasy Premier League injury news site:fantasyfootballscout.co.uk OR premierleague.com")
+    """Fetch injury news summary."""
+    if not _check_api_keys(): return "API Keys missing."
 
-    # 2. Prompt LLM to summarize
-    llm = GoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.3)
+    search = GoogleSearchAPIWrapper()
+    results = search.run("Fantasy Premier League injury news site:fantasyfootballscout.co.uk")
+    
+    llm = GoogleGenerativeAI(model="gemini-pro", temperature=0.3)
     prompt = PromptTemplate(
         input_variables=["news"],
-        template="""
-You're a Fantasy Premier League advisor. Summarize the latest injury and team news from the content below for this Gameweek:
-
-{news}
-"""
+        template="Summarize these FPL injury news items for the upcoming Gameweek:\n{news}"
     )
     chain = LLMChain(llm=llm, prompt=prompt)
-    summary = chain.run(news=results)
-    return summary
-
-
-
-
-from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpStatus
-import pandas as pd
-
-def optimize_starting_11(squad_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Selects the optimal starting 11 from the 15-player squad based on projected points,
-    and then selects the Captain (C) and Vice-Captain (VC) from that 11.
-    
-    Args:
-        squad_df (pd.DataFrame): DataFrame containing the 15 selected players.
-
-    Returns:
-        pd.DataFrame: DataFrame of the 11 selected players, sorted by position, 
-                      including C/VC status and rich player data.
-    """
-    if len(squad_df) != 15:
-        print("Warning: Input DataFrame does not contain exactly 15 players. Please check the squad optimization.")
-        return pd.DataFrame()
-
-    # Create binary decision variables for the starting 11 selection from the squad
-    squad_df['starter'] = squad_df['name'].apply(lambda name: LpVariable(f"starter_{name}", cat='Binary'))
-
-    # Initialize LP problem for starting 11
-    model_xi = LpProblem("FPL_Starting_11_Optimizer", LpMaximize)
-
-    # Objective: maximize projected points of the starting 11
-    model_xi += lpSum(squad_df['starter'] * squad_df['projected_points']), "Maximize_Starting_XI_Points"
-
-    # --- Starting 11 Constraints (Positional Rules) ---
-    model_xi += lpSum(squad_df['starter']) == 11, "Total_XI_Size"
-    
-    gkp_starters = squad_df[squad_df['element_type'] == 1]['starter']
-    def_starters = squad_df[squad_df['element_type'] == 2]['starter']
-    mid_starters = squad_df[squad_df['element_type'] == 3]['starter']
-    fwd_starters = squad_df[squad_df['element_type'] == 4]['starter']
-    
-    model_xi += lpSum(gkp_starters) == 1, "GKP_Count"
-    model_xi += lpSum(def_starters) >= 3, "Min_DEF_Count"
-    model_xi += lpSum(def_starters) <= 5, "Max_DEF_Count"
-    model_xi += lpSum(mid_starters) >= 2, "Min_MID_Count"
-    model_xi += lpSum(mid_starters) <= 5, "Max_MID_Count"
-    model_xi += lpSum(fwd_starters) >= 1, "Min_FWD_Count"
-    model_xi += lpSum(fwd_starters) <= 3, "Max_FWD_Count"
-
-    # Solve the problem
-    model_xi.solve()
-
-    print("\nStarting 11 Status:", LpStatus[model_xi.status])
-
-    # 1. EXTRACT THE SELECTED PLAYERS AS A DATAFRAME
-    starter_df = squad_df.loc[squad_df['starter'].apply(lambda var: var.varValue == 1)].copy()
-    
-    # --- CAPTAINCY SELECTION LOGIC ---
-    starter_df['role'] = 'Starter'
-    
-    if len(starter_df) >= 2:
-        # Sort the starting XI by projected points in descending order
-        sorted_starters = starter_df.sort_values(
-            by='projected_points', 
-            ascending=False
-        ).reset_index(drop=True)
-
-        # Captain: Player with the highest projected points
-        captain_name = sorted_starters.iloc[0]['name']
-        
-        # Vice-Captain: Player with the second highest projected points
-        vice_captain_name = sorted_starters.iloc[1]['name']
-        
-        # Update the 'role' column
-        starter_df.loc[starter_df['name'] == captain_name, 'role'] = 'Captain (C)'
-        starter_df.loc[starter_df['name'] == vice_captain_name, 'role'] = 'Vice-Captain (VC)'
-        
-        print("\n--- Captaincy Selection ---")
-        print(f"👑 Captain (C): {captain_name} ({sorted_starters.iloc[0]['projected_points']:.1f} pts)")
-        print(f"© Vice-Captain (VC): {vice_captain_name} ({sorted_starters.iloc[1]['projected_points']:.1f} pts)")
-        print("-" * 30)
-    
-    # 2. Sort by 'element_type' (1 to 4) to get GKP -> FWD order
-    # Secondary sort by projected_points to order within position
-    starter_df = starter_df.sort_values(
-        by=['element_type', 'projected_points'], 
-        ascending=[True, False]
-    )
-
-    # 3. SELECT THE DESIRED COLUMNS on the DataFrame
-    # Note: 'role' has been added here
-    try:
-        starting_11 = starter_df[[
-            'name', 'position', 'role', 'projected_points', 'now_cost',
-            'form', 'selected_by_percent', 'minutes', 'total_points', 'gw_1_points','gw_2_points', 'gw_3_points',
-            'expected_goals', 'expected_assists', 'points_per_game', 'in_dreamteam',
-             'chance_of_playing_this_round',
-        ]]
-    except KeyError as e:
-        print(f"\nError: Column {e} not found in the DataFrame. Please check the column list.")
-        # Return a simplified version if the rich data columns are missing
-        starting_11 = starter_df[['name', 'position', 'role', 'projected_points', 'now_cost']].copy()
-    
-    return starting_11
-
-
+    return chain.run(news=results)
