@@ -11,6 +11,7 @@ from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain_google_genai import GoogleGenerativeAI
 from langchain_community.utilities import GoogleSearchAPIWrapper
+from collections import defaultdict
 
 # --- Constants ---
 FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
@@ -197,103 +198,161 @@ def plot_cumulative_points(age_limit=26, position='Midfielder', min_cum_points=5
     st.warning("This function uses fig.show() and cannot be displayed directly in Streamlit without modification.")
     return None # Return None to prevent crashing
 
+
+
+
 def fetch_and_forecast_players():
     """
-    Fetches FPL players, maps team names, calculates form from last 3 GWs, 
-    and adjusts projected points based on upcoming fixture difficulty.
+    Fetches FPL players, calculates recent form (last 3 GWs),
+    and adjusts projected points using correctly applied fixture difficulty.
     """
+
     print("Fetching bootstrap data...")
     bootstrap = requests.get(f"{FPL_BASE_URL}bootstrap-static/").json()
-    players_df = pd.DataFrame(bootstrap['elements'])
-    teams_df = pd.DataFrame(bootstrap['teams'])
-    events_df = pd.DataFrame(bootstrap['events'])
-    
-    # 1. Map Team Names (Crucial for display)
-    team_name_map = teams_df.set_index('id')['name'].to_dict()
-    players_df['team_id'] = players_df['team']  # Keep ID for multiplier lookup
-    players_df['team_name'] = players_df['team_id'].map(team_name_map)
-    
-    # Identify Next Gameweek
-    next_event = events_df[events_df['is_next'] == True]
-    next_gw_id = next_event.iloc[0]['id'] if not next_event.empty else 38
+
+    players_df = pd.DataFrame(bootstrap["elements"])
+    teams_df   = pd.DataFrame(bootstrap["teams"])
+    events_df  = pd.DataFrame(bootstrap["events"])
+
+    # ─────────────────────────────────────────────
+    # 1. Team mapping
+    # ─────────────────────────────────────────────
+    team_name_map = teams_df.set_index("id")["name"].to_dict()
+    players_df["team_id"]   = players_df["team"]
+    players_df["team_name"] = players_df["team_id"].map(team_name_map)
+
+    players_df["name"] = players_df["first_name"] + " " + players_df["second_name"]
+
+    # ─────────────────────────────────────────────
+    # 2. Identify next GW
+    # ─────────────────────────────────────────────
+    next_event = events_df[events_df["is_next"] == True]
+    next_gw_id = int(next_event.iloc[0]["id"]) if not next_event.empty else 38
+
     print(f"Forecasting for GW{next_gw_id}...")
 
-    # 2. Calculate Team Difficulty Multipliers
+    # ─────────────────────────────────────────────
+    # 3. Fixture difficulty (CORRECTED)
+    # ─────────────────────────────────────────────
     print("Fetching fixtures...")
     fixtures = requests.get(f"{FPL_BASE_URL}fixtures/").json()
-    
-    # Initialize multipliers (Default 0.30 for blank GWs)
-    # Uses Team IDs (1-20) as keys
-    team_multipliers = {i: 0.30 for i in range(1, 21)}
-    
+
+    team_fixtures = defaultdict(list)
+
     for f in fixtures:
-        if f['event'] == next_gw_id:
-            # Add difficulty multiplier (Handles Double GWs automatically)
-            team_multipliers[f['team_h']] += DIFFICULTY_MULTIPLIER.get(f['team_h_difficulty'], 1.0)
-            team_multipliers[f['team_a']] += DIFFICULTY_MULTIPLIER.get(f['team_a_difficulty'], 1.0)
+        if f["event"] == next_gw_id:
+            team_fixtures[f["team_h"]].append(
+                DIFFICULTY_MULTIPLIER[f["team_h_difficulty"]]
+            )
+            team_fixtures[f["team_a"]].append(
+                DIFFICULTY_MULTIPLIER[f["team_a_difficulty"]]
+            )
 
-    # 3. Filter and Prep Player Data
-    players_df['name'] = players_df['first_name'] + ' ' + players_df['second_name']
-    
-    # Clean chance_of_playing (None usually means 100%)
-    players_df['chance_of_playing_this_round'] = players_df['chance_of_playing_this_round'].fillna(100)
-    # Only keep players likely to play
-    players_df = players_df[players_df['chance_of_playing_this_round'] > 70]
+    # Final team multipliers
+    team_multipliers = {}
+    for team_id in range(1, 21):
+        if team_id not in team_fixtures:
+            # Blank GW
+            team_multipliers[team_id] = 0.30
+        else:
+            # Average difficulty across fixtures (DGW-safe)
+            team_multipliers[team_id] = np.mean(team_fixtures[team_id])
 
-    # Fetch Recent History (Last 3 GWs)
-    # Filter to active players to reduce API calls
-    relevant_players = players_df[players_df['total_points'] >= 10]['id'].tolist()
+    # ─────────────────────────────────────────────
+    # 4. Player filtering
+    # ─────────────────────────────────────────────
+    players_df["chance_of_playing_this_round"] = (
+        players_df["chance_of_playing_this_round"].fillna(100)
+    )
+
+    players_df = players_df[
+        players_df["chance_of_playing_this_round"] > 70
+    ]
+
+    # Only fetch history for active players
+    relevant_players = players_df[
+        players_df["total_points"] >= 10
+    ]["id"].tolist()
+
+    # ─────────────────────────────────────────────
+    # 5. Fetch last 3 GWs history
+    # ─────────────────────────────────────────────
+    print(f"Fetching history for {len(relevant_players)} players...")
     all_recent_points = []
-    
-    print(f"Fetching history for {len(relevant_players)} active players...")
+
     with requests.Session() as session:
         for player_id in tqdm(relevant_players, desc="Processing Players"):
             try:
                 res = session.get(f"{FPL_BASE_URL}element-summary/{player_id}/")
-                if res.status_code == 200:
-                    history = res.json().get('history', [])
-                    last_3 = history[-3:] if len(history) >= 3 else history
-                    
-                    if last_3:
-                        for i, gw in enumerate(reversed(last_3)):
-                            all_recent_points.append({
-                                'player_id': player_id,
-                                'gw_rank': i + 1, # 1 = most recent
-                                'total_points': gw['total_points']
-                            })
+                if res.status_code != 200:
+                    continue
+
+                history = res.json().get("history", [])
+                last_3  = history[-3:]
+
+                for i, gw in enumerate(reversed(last_3)):
+                    all_recent_points.append({
+                        "player_id": player_id,
+                        "gw_rank": i + 1,  # 1 = most recent
+                        "points": gw["total_points"]
+                    })
+
             except Exception:
                 continue
 
-    # 4. Merge History and Calculate Projections
+    # ─────────────────────────────────────────────
+    # 6. Merge history
+    # ─────────────────────────────────────────────
     if all_recent_points:
         history_df = pd.DataFrame(all_recent_points)
-        pivot = history_df.pivot(index='player_id', columns='gw_rank', values='total_points')
-        pivot.columns = [f'gw_{col}_points' for col in pivot.columns]
-        players_df = players_df.merge(pivot, left_on='id', right_index=True, how='left')
-    
-    # Fill missing history with 0
-    for col in ['gw_1_points', 'gw_2_points', 'gw_3_points']:
-        if col not in players_df.columns:
-            players_df[col] = 0
-        players_df[col] = players_df[col].fillna(0)
 
-    # Weighted Form Projection
-    players_df['base_form_points'] = (
-        0.45 * players_df['gw_1_points'] + 
-        0.35 * players_df['gw_2_points'] + 
-        0.20 * players_df['gw_3_points']
+        pivot = history_df.pivot(
+            index="player_id",
+            columns="gw_rank",
+            values="points"
+        ).rename(columns={
+            1: "gw_1_points",
+            2: "gw_2_points",
+            3: "gw_3_points"
+        })
+
+        players_df = players_df.merge(
+            pivot, left_on="id", right_index=True, how="left"
+        )
+
+    for col in ["gw_1_points", "gw_2_points", "gw_3_points"]:
+        players_df[col] = players_df.get(col, 0).fillna(0)
+
+    # ─────────────────────────────────────────────
+    # 7. Form calculation
+    # ─────────────────────────────────────────────
+    players_df["base_form_points"] = (
+        0.45 * players_df["gw_1_points"] +
+        0.35 * players_df["gw_2_points"] +
+        0.20 * players_df["gw_3_points"]
     )
-    
-    # Apply Fixture Difficulty based on Team ID
-    players_df['fixture_multiplier'] = players_df['team_id'].map(team_multipliers)
-    players_df['projected_points'] = players_df['base_form_points'] * players_df['fixture_multiplier']
-    players_df['projected_points'] = np.floor(players_df['projected_points'])
-    
-    # Final Data Cleanup for UI
-    players_df['now_cost'] = players_df['now_cost'] / 10
-    players_df['team'] = players_df['team_name'] # Final swap to team name string
 
-    return players_df.sort_values(by='projected_points', ascending=False)
+    # ─────────────────────────────────────────────
+    # 8. Apply fixture multiplier
+    # ─────────────────────────────────────────────
+    players_df["fixture_multiplier"] = (
+        players_df["team_id"].map(team_multipliers)
+    )
+
+    players_df["projected_points"] = (
+        players_df["base_form_points"] *
+        players_df["fixture_multiplier"]
+    ).apply(np.floor)
+
+    # ─────────────────────────────────────────────
+    # 9. Final cleanup
+    # ─────────────────────────────────────────────
+    players_df["now_cost"] = players_df["now_cost"] / 10
+    players_df["team"]     = players_df["team_name"]
+
+    return players_df.sort_values(
+        by="projected_points", ascending=False
+    ).reset_index(drop=True)
 
 def optimize_fpl_team(players_df, players_to_keep=None, players_to_exclude=None):
     """Runs Linear Programming to select the best 15-man squad."""
