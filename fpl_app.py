@@ -19,8 +19,8 @@ st.set_page_config(
 @st.cache_data(ttl=3600)
 def load_data():
     """Loads FPL player and position data."""
-    players_df, positions_df = pl.load_fpl_data()
-    return players_df, positions_df
+    players_df,  positions_df = pl.load_fpl_data()
+    return players_df,  positions_df 
 
 @st.cache_data(ttl=3600)
 def fetch_and_forecast_data():
@@ -32,7 +32,7 @@ def fetch_and_forecast_data():
 if 'app_ready' not in st.session_state:
     with st.status("🚀 Initializing FPL Optimizer...", expanded=True) as status:
         st.write("📡 Connecting to Premier League API...")
-        players_df, positions_df = load_data()
+        players_df, positions_df  = load_data()
         time.sleep(0.3)
         
         st.write("📊 Processing player statistics...")
