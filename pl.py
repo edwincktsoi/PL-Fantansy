@@ -72,6 +72,8 @@ def plot_player_performance_timeseries(player_names, players_df):
     )
 
     return fig_cum, fig_weekly
+
+
 def plot_points_vs_cost(players_df, positions_df):
     """Plot total FPL points vs cost separated by position using facets."""
     df = players_df.copy()
@@ -91,7 +93,7 @@ def plot_points_vs_cost(players_df, positions_df):
         color='position_name', 
         facet_col='position_name', # <-- KEY CHANGE: Facet the plot by position
         facet_col_wrap=2,          # Display 2 plots per row
-        hover_name='web_name',
+        hover_name='name',
         trendline='ols',
         labels={'cost_m': 'Cost (£m)', 'total_points': 'Total Points'},
         title='Total Points vs Cost - Separated by Position'
@@ -155,25 +157,52 @@ def download_fpl_data(save_dir="data/fpl", save_csv=True):
     print(f"✅ FPL data downloaded to: {save_path.resolve()}")
     return data
 
+import requests
+import pandas as pd
+
 def load_fpl_data():
     """Load FPL data from API."""
+    
     data = requests.get(f"{FPL_BASE_URL}bootstrap-static/").json()
+    
     players_df = pd.DataFrame(data['elements'])
     teams_df = pd.DataFrame(data['teams'])
 
-    # Map team names
+    # --- Team mapping ---
     team_name_map = teams_df.set_index('id')['name'].to_dict()
     players_df['team'] = players_df['team'].map(team_name_map)
 
-    # Position
+    # --- Position mapping ---
     players_df['position_name'] = players_df['element_type'].map(POSITION_MAP)
+
+    # --- Player name ---
     players_df['name'] = players_df['first_name'] + ' ' + players_df['second_name']
 
-    # Age
+    # --- Age ---
     players_df['birth_date'] = pd.to_datetime(players_df['birth_date'], errors='coerce')
     players_df['age'] = (pd.Timestamp.now() - players_df['birth_date']).dt.days // 365
 
-    return players_df, data['element_types']
+    # --- Status mapping ---
+    status_map = {
+        "a": "Available",
+        "d": "Doubtful",
+        "i": "Injured",
+        "s": "Suspended",
+        "u": "Unavailable",
+        "n": "Not in Squad"
+    }
+
+    players_df["status_readable"] = players_df["status"].map(status_map)
+
+    # --- Injury table (optional but useful for medical tab) ---
+    injuries_df = (
+        players_df
+        .query("status not in ['a','u','n']")
+        [["name", "team", "position_name", "status_readable", "news", "chance_of_playing_this_round"]]
+        .sort_values(["team", "chance_of_playing_this_round"])
+    )
+
+    return players_df, injuries_df, data['element_types']
 
 # ---------------------------
 # 2️⃣ PLAYER FORECASTING (DGW + BGW aware)
