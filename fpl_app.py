@@ -19,8 +19,8 @@ st.set_page_config(
 @st.cache_data(ttl=3600)
 def load_data():
     """Loads FPL player and position data."""
-    players_df,  positions_df = pl.load_fpl_data()
-    return players_df,  positions_df 
+    players_df, injuries_df,  positions_df = pl.load_fpl_data()
+    return players_df, injuries_df,  positions_df 
 
 @st.cache_data(ttl=3600)
 def fetch_and_forecast_data():
@@ -32,7 +32,7 @@ def fetch_and_forecast_data():
 if 'app_ready' not in st.session_state:
     with st.status("🚀 Initializing FPL Optimizer...", expanded=True) as status:
         st.write("📡 Connecting to Premier League API...")
-        players_df, positions_df  = load_data()
+        players_df, injuries_df, positions_df  = load_data()
         time.sleep(0.3)
         
         st.write("📊 Processing player statistics...")
@@ -429,7 +429,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Load data
-players_df, positions_df = load_data()
+players_df, injuries_df,  positions_df  = load_data()
 
 def create_pitch_visualization(squad_df, starting_11_df=None):
     """Enhanced pitch visualization with better aesthetics"""
@@ -916,149 +916,147 @@ with tab_analytics:
             margin=dict(t=40, b=40)
         )
         st.plotly_chart(fig_empty, use_container_width=True)
-        
-# TAB 2: Build Squad
-# TAB: Recruitment & Performance (MERGED)
+
 with tab_recruit_perf:
     st.markdown("## 🧠 Recruitment Hub")
     st.caption("Build your optimal squad and analyse team performance in one place")
 
     recruit_tab, perf_tab = st.tabs(["🎯 AI Scouts", "📈 Recruitment Analysts"])
 
-    # ── SUB-TAB 1: RECRUITMENT (previously tab2) ──────────────────────────────
+    # ── SUB-TAB 1: RECRUITMENT ────────────────────────────────────────────────
     with recruit_tab:
         st.markdown("### 🎯 Build Your Optimal Squad")
         st.caption("Set your constraints and let AI find the best team for you")
 
-        if 'players_df' in locals() or 'players_df' in globals():
-            if 'name' not in players_df.columns:
-                players_df['name'] = players_df['first_name'] + ' ' + players_df['second_name']
-            if 'position_name' not in players_df.columns:
-                pos_map = {1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'}
-                players_df['position_name'] = players_df['element_type'].map(pos_map)
+        if 'players_df' not in locals() and 'players_df' not in globals():
+            st.error("Please load the FPL data first.")
+            st.stop()
 
-            if 'players_to_keep' not in st.session_state:
+        if 'name' not in players_df.columns:
+            players_df['name'] = players_df['first_name'] + ' ' + players_df['second_name']
+        if 'position_name' not in players_df.columns:
+            pos_map = {1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'}
+            players_df['position_name'] = players_df['element_type'].map(pos_map)
+
+        if 'players_to_keep' not in st.session_state:
+            st.session_state.players_to_keep = []
+        if 'players_to_exclude' not in st.session_state:
+            st.session_state.players_to_exclude = []
+
+        # ── Constraint counters ────────────────────────────────────────────
+        m1, m2, m3 = st.columns([2, 2, 1])
+        with m1:
+            st.markdown(f"""
+                <div class='stat-card'>
+                    <div class='stat-value'>{len(st.session_state.players_to_keep)}</div>
+                    <div class='stat-label'>🔒 Locked In</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with m2:
+            st.markdown(f"""
+                <div class='stat-card'>
+                    <div class='stat-value'>{len(st.session_state.players_to_exclude)}</div>
+                    <div class='stat-label'>🚫 Excluded</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with m3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🗑️ Reset All", use_container_width=True, key="recruit_reset"):
                 st.session_state.players_to_keep = []
-            if 'players_to_exclude' not in st.session_state:
                 st.session_state.players_to_exclude = []
+                st.rerun()
 
-            col_header, col_reset = st.columns([3, 1])
-            with col_header:
-                st.markdown("#### 👥 Player Constraints")
-                st.caption("Force include or exclude specific players from your squad")
-            with col_reset:
-                if st.button("🗑️ Reset", use_container_width=True, key="recruit_reset"):
-                    st.session_state.players_to_keep = []
-                    st.session_state.players_to_exclude = []
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        teams_list = sorted(players_df['team'].unique().tolist())
+        col1, col2 = st.columns(2)
+
+        # ── Force Include ──────────────────────────────────────────────────
+        with col1:
+            st.markdown("""
+                <div class='modern-card'>
+                    <h4 style='margin-top: 0; color: #28a745;'>🔒 Force Include</h4>
+                    <p style='color: #6c757d; font-size: 0.9rem;'>Players that must be in your squad</p>
+                </div>
+            """, unsafe_allow_html=True)
+
+            sel_team_inc = st.selectbox("Select Team", [""] + teams_list, key="inc_team")
+            if sel_team_inc:
+                team_p = players_df[players_df['team'] == sel_team_inc].sort_values('web_name')
+                p_options = [
+                    f"{row['web_name']} ({row['position_name']} - £{row['now_cost']:.1f}m)"
+                    for _, row in team_p.iterrows()
+                ]
+                selected = st.multiselect("Choose Players", options=p_options, key="inc_p_multi")
+                if st.button("➕ Add to Squad", key="btn_add_inc", use_container_width=True):
+                    for item in selected:
+                        p_web_name = item.split(" (")[0]
+                        full_name = team_p[team_p['web_name'] == p_web_name]['name'].values[0]
+                        if full_name not in st.session_state.players_to_keep:
+                            st.session_state.players_to_keep.append(full_name)
                     st.rerun()
 
-            m1, m2 = st.columns(2)
-            with m1:
-                st.markdown(f"""
-                    <div class='stat-card'>
-                        <div class='stat-value'>{len(st.session_state.players_to_keep)}</div>
-                        <div class='stat-label'>🔒 Locked In</div>
-                    </div>
-                """, unsafe_allow_html=True)
-            with m2:
-                st.markdown(f"""
-                    <div class='stat-card'>
-                        <div class='stat-value'>{len(st.session_state.players_to_exclude)}</div>
-                        <div class='stat-label'>🚫 Excluded</div>
-                    </div>
-                """, unsafe_allow_html=True)
+            if st.session_state.players_to_keep:
+                st.markdown("<br>", unsafe_allow_html=True)
+                for p_name in st.session_state.players_to_keep:
+                    p_data = players_df[players_df['name'] == p_name].iloc[0]
+                    col_a, col_b = st.columns([5, 1])
+                    with col_a:
+                        st.markdown(f"""
+                            <div class='success-banner' style='padding: 0.75rem; margin-bottom: 0.5rem;'>
+                                <strong>{p_name}</strong> ({p_data['team']})
+                            </div>
+                        """, unsafe_allow_html=True)
+                    with col_b:
+                        if st.button("✕", key=f"del_inc_{p_name}"):
+                            st.session_state.players_to_keep.remove(p_name)
+                            st.rerun()
 
-            st.markdown("<br>", unsafe_allow_html=True)
+        # ── Force Exclude ──────────────────────────────────────────────────
+        with col2:
+            st.markdown("""
+                <div class='modern-card'>
+                    <h4 style='margin-top: 0; color: #dc3545;'>🚫 Force Exclude</h4>
+                    <p style='color: #6c757d; font-size: 0.9rem;'>Players to avoid in optimization</p>
+                </div>
+            """, unsafe_allow_html=True)
 
-            teams_list = sorted(players_df['team'].unique().tolist())
-            col1, col2 = st.columns(2)
+            sel_team_exc = st.selectbox("Select Team", [""] + teams_list, key="exc_team")
+            if sel_team_exc:
+                team_p = players_df[players_df['team'] == sel_team_exc].sort_values('web_name')
+                p_options = [
+                    f"{row['web_name']} ({row['position_name']} - £{row['now_cost']:.1f}m)"
+                    for _, row in team_p.iterrows()
+                ]
+                selected = st.multiselect("Choose Players", options=p_options, key="exc_p_multi")
+                if st.button("➕ Add to Exclusions", key="btn_add_exc", use_container_width=True):
+                    for item in selected:
+                        p_web_name = item.split(" (")[0]
+                        full_name = team_p[team_p['web_name'] == p_web_name]['name'].values[0]
+                        if full_name not in st.session_state.players_to_exclude:
+                            st.session_state.players_to_exclude.append(full_name)
+                    st.rerun()
 
-            with col1:
-                st.markdown("""
-                    <div class='modern-card'>
-                        <h4 style='margin-top: 0; color: #28a745;'>🔒 Force Include</h4>
-                        <p style='color: #6c757d; font-size: 0.9rem;'>Players that must be in your squad</p>
-                    </div>
-                """, unsafe_allow_html=True)
+            if st.session_state.players_to_exclude:
+                st.markdown("<br>", unsafe_allow_html=True)
+                for p_name in st.session_state.players_to_exclude:
+                    p_data = players_df[players_df['name'] == p_name].iloc[0]
+                    col_a, col_b = st.columns([5, 1])
+                    with col_a:
+                        st.markdown(f"""
+                            <div class='warning-banner' style='padding: 0.75rem; margin-bottom: 0.5rem;'>
+                                <strong>{p_name}</strong> ({p_data['team']})
+                            </div>
+                        """, unsafe_allow_html=True)
+                    with col_b:
+                        if st.button("✕", key=f"del_exc_{p_name}"):
+                            st.session_state.players_to_exclude.remove(p_name)
+                            st.rerun()
 
-                sel_team_inc = st.selectbox("Select Team", [""] + teams_list, key="inc_team")
+        players_to_keep = st.session_state.players_to_keep
+        players_to_exclude = st.session_state.players_to_exclude
 
-                if sel_team_inc:
-                    team_p = players_df[players_df['team'] == sel_team_inc].sort_values('web_name')
-                    p_options = [f"{row['web_name']} ({row['position_name']} - £{row['now_cost']:.1f}m)"
-                                 for _, row in team_p.iterrows()]
-                    selected = st.multiselect("Choose Players", options=p_options, key="inc_p_multi")
-
-                    if st.button("➕ Add to Squad", key="btn_add_inc", use_container_width=True):
-                        for item in selected:
-                            p_web_name = item.split(" (")[0]
-                            full_name = team_p[team_p['web_name'] == p_web_name]['name'].values[0]
-                            if full_name not in st.session_state.players_to_keep:
-                                st.session_state.players_to_keep.append(full_name)
-                        st.rerun()
-
-                if st.session_state.players_to_keep:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    for p_name in st.session_state.players_to_keep:
-                        p_data = players_df[players_df['name'] == p_name].iloc[0]
-                        col_a, col_b = st.columns([5, 1])
-                        with col_a:
-                            st.markdown(f"""
-                                <div class='success-banner' style='padding: 0.75rem; margin-bottom: 0.5rem;'>
-                                    <strong>{p_name}</strong> ({p_data['team']})
-                                </div>
-                            """, unsafe_allow_html=True)
-                        with col_b:
-                            if st.button("✕", key=f"del_inc_{p_name}"):
-                                st.session_state.players_to_keep.remove(p_name)
-                                st.rerun()
-
-            with col2:
-                st.markdown("""
-                    <div class='modern-card'>
-                        <h4 style='margin-top: 0; color: #dc3545;'>🚫 Force Exclude</h4>
-                        <p style='color: #6c757d; font-size: 0.9rem;'>Players to avoid in optimization</p>
-                    </div>
-                """, unsafe_allow_html=True)
-
-                sel_team_exc = st.selectbox("Select Team", [""] + teams_list, key="exc_team")
-
-                if sel_team_exc:
-                    team_p = players_df[players_df['team'] == sel_team_exc].sort_values('web_name')
-                    p_options = [f"{row['web_name']} ({row['position_name']} - £{row['now_cost']:.1f}m)"
-                                 for _, row in team_p.iterrows()]
-                    selected = st.multiselect("Choose Players", options=p_options, key="exc_p_multi")
-
-                    if st.button("➕ Add to Exclusions", key="btn_add_exc", use_container_width=True):
-                        for item in selected:
-                            p_web_name = item.split(" (")[0]
-                            full_name = team_p[team_p['web_name'] == p_web_name]['name'].values[0]
-                            if full_name not in st.session_state.players_to_exclude:
-                                st.session_state.players_to_exclude.append(full_name)
-                        st.rerun()
-
-                if st.session_state.players_to_exclude:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    for p_name in st.session_state.players_to_exclude:
-                        p_data = players_df[players_df['name'] == p_name].iloc[0]
-                        col_a, col_b = st.columns([5, 1])
-                        with col_a:
-                            st.markdown(f"""
-                                <div class='warning-banner' style='padding: 0.75rem; margin-bottom: 0.5rem;'>
-                                    <strong>{p_name}</strong> ({p_data['team']})
-                                </div>
-                            """, unsafe_allow_html=True)
-                        with col_b:
-                            if st.button("✕", key=f"del_exc_{p_name}"):
-                                st.session_state.players_to_exclude.remove(p_name)
-                                st.rerun()
-
-            players_to_keep = st.session_state.players_to_keep
-            players_to_exclude = st.session_state.players_to_exclude
-
-        else:
-            st.error("Please load the FPL data first.")
-
+        # ── Optimize CTA ───────────────────────────────────────────────────
         st.markdown("---")
         st.markdown("### 🚀 Generate Optimal Squad")
         run_opt = st.button("⚡ Optimize My Team", type="primary", use_container_width=True)
@@ -1083,7 +1081,6 @@ with tab_recruit_perf:
             selected_df = forecast_df[forecast_df["name"].isin(selected_names)].copy()
             POSITION_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
             selected_df["position_name"] = selected_df["element_type"].map(POSITION_MAP)
-
             starting_11 = pl.optimize_starting_11(selected_df)
 
             st.session_state["selected_squad_df"] = selected_df
@@ -1096,18 +1093,17 @@ with tab_recruit_perf:
             progress_bar.empty()
             status_text.empty()
 
+        # ── Results (shown below CTA once optimized) ───────────────────────
         if "selected_squad_df" in st.session_state:
             selected_df = st.session_state["selected_squad_df"]
             starting_11 = st.session_state["starting_11_df"]
 
-            st.markdown("---")
-
             counts = starting_11['position_name'].value_counts()
-            formation_str = f"{counts.get('DEF', 0)}-{counts.get('MID', 0)}-{counts.get('FWD', 0)}"
+            formation_str = f"{counts.get('DEF',0)}-{counts.get('MID',0)}-{counts.get('FWD',0)}"
 
+            st.markdown("---")
             st.markdown("## 📊 Squad Summary")
             col1, col2, col3, col4, col5 = st.columns(5)
-
             with col1:
                 st.markdown(f"<div class='stat-card'><div class='stat-value'>£{selected_df['now_cost'].sum():.1f}m</div><div class='stat-label'>Squad Cost</div></div>", unsafe_allow_html=True)
             with col2:
@@ -1149,62 +1145,40 @@ with tab_recruit_perf:
                         </div>
                     """, unsafe_allow_html=True)
 
-    # ── SUB-TAB 2: TEAM PERFORMANCE ANALYSIS (previously tab3) ────────────────
+    # ── SUB-TAB 2: RECRUITMENT ANALYSTS ───────────────────────────────────────
     with perf_tab:
         st.markdown("### 📈 Advanced Analytics")
         st.caption("Deep dive into squad performance and optimization details")
 
-        if 'selected_squad_df' in st.session_state:
+        if "selected_squad_df" not in st.session_state:
+            st.markdown("""
+                <div class='warning-banner'>
+                    <h3 style='margin:0; color:#856404;'>⚠️ No Squad Data</h3>
+                    <p style='margin:0.5rem 0 0 0;'>
+                        Please run the Squad Optimizer in the <strong>🎯 AI Scouts</strong> tab first.
+                    </p>
+                </div>
+            """, unsafe_allow_html=True)
+        else:
             selected_df = st.session_state['selected_squad_df']
             starting_11 = st.session_state.get('starting_11_df', pd.DataFrame())
 
-            st.markdown("#### 🎯 Optimization Visualization")
-            try:
-                if 'fig_optimization' in st.session_state:
-                    st.plotly_chart(st.session_state['fig_optimization'], use_container_width=True)
-                else:
-                    st.info("📊 Optimization chart will appear after running the optimizer")
-            except:
-                st.info("📊 Run optimization to see visualization")
-
-            st.markdown("---")
-
-            st.markdown("#### 📋 Complete Squad Breakdown")
-            sorted_squad_df = selected_df.sort_values(by=['element_type', 'projected_points'], ascending=[True, False])
-            display_df = sorted_squad_df[['name', 'position_name', 'team', 'now_cost', 'projected_points', 'fixture_multiplier', 'form']].copy()
-            display_df.columns = ['Player', 'Position', 'Team', 'Cost (£m)', 'Proj. Points', 'Fixture', 'Form']
-
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Cost (£m)": st.column_config.NumberColumn(format="£%.1f"),
-                    "Proj. Points": st.column_config.NumberColumn(format="%.1f"),
-                    "Fixture": st.column_config.NumberColumn(format="%.2f"),
-                    "Form": st.column_config.NumberColumn(format="%.1f")
-                }
-            )
-
-            st.markdown("---")
-
+            # ── 1. Captain picks (most actionable) ────────────────────────
             st.markdown("#### 🔴 Captain Recommendations")
             st.caption("Your captain scores double points - choose wisely!")
 
             if not starting_11.empty:
                 captain_options = starting_11.sort_values('projected_points', ascending=False)
-                col1, col2 = st.columns([2, 1])
-
                 POSITION_MAP = {1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'}
                 if 'element_type' not in captain_options.columns:
                     captain_options = captain_options.merge(selected_df[['name', 'element_type']], on='name', how='left')
                 if 'position_name' not in captain_options.columns:
                     captain_options['position_name'] = captain_options['element_type'].map(POSITION_MAP)
 
+                col1, col2 = st.columns([2, 1])
                 with col1:
                     st.markdown("##### 🏆 Top 5 Captain Picks")
                     top_5 = captain_options.head(5)[['name', 'position_name', 'team', 'projected_points', 'form']].copy()
-
                     for idx, (_, row) in enumerate(top_5.iterrows()):
                         pts = float(row['projected_points'])
                         double_pts = pts * 2
@@ -1216,7 +1190,6 @@ with tab_recruit_perf:
                             badge, bg_color = "🥉", "linear-gradient(135deg, #cd7f32 0%, #e8a87c 100%)"
                         else:
                             badge, bg_color = "⭐", "white"
-
                         st.markdown(f"""
                             <div class='modern-card' style='background: {bg_color}; margin-bottom: 0.8rem;'>
                                 <div style='display: flex; justify-content: space-between; align-items: center;'>
@@ -1249,8 +1222,28 @@ with tab_recruit_perf:
                         </div>
                     """, unsafe_allow_html=True)
 
+            # ── 2. Full squad table ────────────────────────────────────────
             st.markdown("---")
+            st.markdown("#### 📋 Complete Squad Breakdown")
+            sorted_squad_df = selected_df.sort_values(
+                by=['element_type', 'projected_points'], ascending=[True, False]
+            )
+            display_df = sorted_squad_df[['name', 'position_name', 'team', 'now_cost', 'projected_points', 'fixture_multiplier', 'form']].copy()
+            display_df.columns = ['Player', 'Position', 'Team', 'Cost (£m)', 'Proj. Points', 'Fixture', 'Form']
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Cost (£m)": st.column_config.NumberColumn(format="£%.1f"),
+                    "Proj. Points": st.column_config.NumberColumn(format="%.1f"),
+                    "Fixture": st.column_config.NumberColumn(format="%.2f"),
+                    "Form": st.column_config.NumberColumn(format="%.1f"),
+                }
+            )
 
+            # ── 3. Distribution analysis ───────────────────────────────────
+            st.markdown("---")
             st.markdown("#### ⚽ Squad Distribution Analysis")
             col1, col2, col3 = st.columns(3)
 
@@ -1277,17 +1270,15 @@ with tab_recruit_perf:
                 st.markdown(f"<div class='modern-card' style='padding: 0.6rem; margin-bottom: 0.5rem;'><strong>Most Expensive:</strong> £{max_cost:.1f}m</div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='modern-card' style='padding: 0.6rem;'><strong>Cheapest:</strong> £{min_cost:.1f}m</div>", unsafe_allow_html=True)
 
-        else:
-            st.markdown("""
-                <div class='warning-banner'>
-                    <h3 style='margin:0; color:#856404;'>⚠️ No Squad Data</h3>
-                    <p style='margin:0.5rem 0 0 0;'>
-                        Please run the Squad Optimizer in the <strong>Build Optimal Squad</strong> tab first.
-                    </p>
-                </div>
-            """, unsafe_allow_html=True)
-
-
+            # ── 4. Optimization chart (least actionable, last) ─────────────
+            st.markdown("---")
+            st.markdown("#### 🎯 Optimization Visualization")
+            st.caption("Model output showing how players were scored and selected")
+            if 'fig_optimization' in st.session_state:
+                st.plotly_chart(st.session_state['fig_optimization'], use_container_width=True)
+            else:
+                st.info("📊 Optimization chart will appear after running the optimizer")
+                
 # TAB 4: AI Advisor
 with tab4:
     st.markdown("## 🤖 AI Squad Advisor")
@@ -1328,46 +1319,112 @@ with tab4:
         """, unsafe_allow_html=True)
 
 # TAB 5: Injury News
-with tab5:
-    st.markdown("## 🚑 Latest Injury & Team News")
-    st.caption("Stay updated with the latest injury reports and team news")
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        if st.button("📰 Fetch Latest News", type="primary", use_container_width=True):
-            with st.spinner("🔍 Gathering news from multiple sources..."):
-                news = pl.get_fpl_injury_news()
-                
-                st.markdown(f"""
-                    <div class='modern-card'>
-                        <h4 style='margin:0; color:#37003c;'>🚑 Injury News Summary</h4>
-                        <hr style='margin:1rem 0; border:none; height:1px; background:#e8eaed;'>
-                        <div style='color:#202124; line-height:1.8;'>{news}</div>
-                    </div>
-                """, unsafe_allow_html=True)
-    
-    st.markdown("""
-        <div class='info-banner'>
-            <h4 style='margin-top: 0;'>💡 Why Check Injury News?</h4>
-            <ul style='margin: 0.5rem 0; padding-left: 1.5rem;'>
-                <li>Avoid selecting injured or doubtful players</li>
-                <li>Find differential picks when key players are out</li>
-                <li>Plan transfers based on return dates</li>
-                <li>Stay ahead of price changes</li>
-            </ul>
-        </div>
-    """, unsafe_allow_html=True)
+import plotly.express as px
+from streamlit_plotly_events import plotly_events
 
-# Footer
-st.markdown("---")
-st.markdown("""
-    <div style='text-align:center; padding:2rem; color:#5f6368;'>
-        <p style='margin:0; font-size:0.95rem; font-weight: 500;'>
-            💜 Built with <strong>Streamlit</strong> | 
-            Data from <strong>Official FPL API</strong> | 
-        </p>
-        <p style='margin:0.5rem 0 0 0; font-size:0.85rem; opacity:0.8;'>
-            © 2025 FPL AI Optimizer | Made with ⚽ for FPL managers
-        </p>
-    </div>
-""", unsafe_allow_html=True)
+# TAB 5: Injury News
+with tab5:
+    st.markdown("## 🚑 Injury & team news")
+    
+    TEAM_COLORS = {
+        # Existing teams
+        "Arsenal": "#EF0107",        # Red
+        "Aston Villa": "#670E36",    # Claret
+        "Bournemouth": "#DA291C",    # Red
+        "Brentford": "#E30613",      # Red & white stripes
+        "Brighton": "#0057B8",       # Blue & white stripes
+        "Chelsea": "#034694",        # Blue
+        "Crystal Palace": "#1B458F", # Red & blue
+        "Everton": "#003399",        # Blue
+        "Fulham": "#FFFFFF",         # White
+        "Leeds": "#FFFFFF",          # White
+        "Liverpool": "#C8102E",      # Red
+        "Man City": "#6CABDD",       # Sky blue
+        "Man Utd": "#DA291C",        # Red
+        "Newcastle": "#241F20",      # Black
+        "Nott'm Forest": "#EF3340",     # Red
+        "Sheffield Utd": "#EE2737",  # Red
+        "Spurs": "#FFFFFF",      # White
+        "West Ham": "#7A263A",       # Claret
+        "Wolves": "#FDB913",         # Gold
+
+        # 2025-26 promoted teams (replacing Leicester, Ipswich, Southampton)
+        "Burnley": "#6C1D45",        # Claret
+        "Sunderland": "#EB172B",     # Red
+    }
+
+    # ── Team summary ───────────────────────────────────────────────────────
+    team_summary = (
+        injuries_df
+        .groupby("team").size()
+        .reset_index(name="injured_players")
+        .sort_values("team")
+        .reset_index(drop=True)
+    )
+
+    # ── Bar chart via st.bar_chart alternative: Plotly with selectbox only ─
+    bar_colors = [TEAM_COLORS.get(t, "#888888") for t in team_summary["team"]]
+    border_colors = [
+        "black" if TEAM_COLORS.get(t, "").upper() in ("#FFFFFF", "#CCCCCC", "WHITE")
+        else "rgba(0,0,0,0)"
+        for t in team_summary["team"]
+    ]
+
+    fig = go.Figure(go.Bar(
+        x=team_summary["team"],
+        y=team_summary["injured_players"],
+        marker_color=bar_colors,
+        marker_line_color=border_colors,
+        marker_line_width=1.5,
+        hovertemplate="<b>%{x}</b><br>%{y} injured<extra></extra>",
+    ))
+
+    fig.update_layout(
+        title={
+        'text': "🚑 Injuries per Team",
+        'y':0.95,
+        'x':0.5,
+        'xanchor': 'center',
+        'yanchor': 'top'
+    },
+        xaxis_title=None,
+        yaxis_title="Injured players",
+        showlegend=False,
+        margin=dict(t=8, b=8, l=0, r=0),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(tickfont=dict(size=11)),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Top bar: dropdown + clear ──────────────────────────────────────────
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    st.caption("Click a bar to filter the table below, or use the dropdown.")
+
+    col_sel, col_btn = st.columns([3, 1])
+    with col_sel:
+        teams = ["All teams"] + sorted(injuries_df["team"].unique())
+        selected_team = st.selectbox("Filter by team", teams, label_visibility="collapsed")
+    with col_btn:
+        if st.button("Clear", use_container_width=True):
+            st.session_state["selected_team_chart"] = "All teams"
+            st.rerun()
+
+    # ── Filter logic ───────────────────────────────────────────────────────
+    injuries_filtered = (
+        injuries_df[injuries_df["team"] == selected_team]
+        if selected_team != "All teams"
+        else injuries_df.copy()
+    )
+
+    label = selected_team if selected_team != "All teams" else "All teams"
+    st.markdown(f"**Showing:** {label} · {len(injuries_filtered)} player(s)")
+
+    # ── Injury table ───────────────────────────────────────────────────────
+    display_cols = [c for c in injuries_filtered.columns if c != "chance_of_playing_this_round"]
+    st.dataframe(
+        injuries_filtered[display_cols].sort_values("team"),
+        use_container_width=True,
+        hide_index=True,
+    )
