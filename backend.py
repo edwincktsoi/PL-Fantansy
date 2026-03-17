@@ -12,9 +12,16 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
+
 FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
-DIFFICULTY_MULTIPLIER = {1: 1.20, 2: 1.10, 3: 1.00, 4: 0.85, 5: 0.70}
-POSITION_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+DIFFICULTY_MULTIPLIER = {
+    1: 1.20,  # Very Easy
+    2: 1.10,  # Easy
+    3: 1.00,  # Average
+    4: 0.85,  # Hard
+    5: 0.70   # Very Hard
+}
+POSITION_MAP = {1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'}
 POSITION_CONSTRAINTS = {1: 2, 2: 5, 3: 5, 4: 3}  # required count per position
 BUDGET = 100.0
 SQUAD_SIZE = 15
@@ -22,7 +29,6 @@ XI_SIZE = 11
 MAX_PER_TEAM = 3
 MIN_CHANCE_OF_PLAYING = 70
 MIN_TOTAL_POINTS = 10
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -37,32 +43,64 @@ def fetch_player_history(player_id: int) -> list[dict]:
     data = _get(f"{FPL_BASE_URL}element-summary/{player_id}/")
     return data.get("history", [])
 
-
-# ── Data Download ──────────────────────────────────────────────────────────────
-
-def load_fpl_data(input_dir="./input"):
-    """Read FPL data from Parquet files."""
+def download_fpl_data(save=True):
+    """Load FPL data from API and save as Parquet."""
     
-    input_path = Path(input_dir)
-
-    # --- Validation ---
-    required_files = ["players.parquet", "injuries.parquet", "teams.parquet"]
-    for file in required_files:
-        if not (input_path / file).exists():
-            raise FileNotFoundError(
-                f"{file} not found in {input_dir}. Run load_fpl_data() first."
-            )
-
-    # --- Read ---
-    players_df = pd.read_parquet(input_path / "players.parquet")
-    injuries_df = pd.read_parquet(input_path / "injuries.parquet")
-    teams_df = pd.read_parquet(input_path / "teams.parquet")
-
-    return players_df, injuries_df, teams_df
-
+    data = requests.get(f"{FPL_BASE_URL}bootstrap-static/").json()
     
+    players_df = pd.DataFrame(data['elements'])
+    teams_df = pd.DataFrame(data['teams'])
+
+    # --- Team mapping ---
+    team_name_map = teams_df.set_index('id')['name'].to_dict()
+    players_df['team'] = players_df['team'].map(team_name_map)
+
+    # --- Position mapping ---
+    players_df['position_name'] = players_df['element_type'].map(POSITION_MAP)
+
+    # --- Player name ---
+    players_df['name'] = players_df['first_name'] + ' ' + players_df['second_name']
+
+    # --- Age ---
+    players_df['birth_date'] = pd.to_datetime(players_df['birth_date'], errors='coerce')
+    players_df['age'] = (pd.Timestamp.now() - players_df['birth_date']).dt.days // 365
+
+    # --- Status mapping ---
+    status_map = {
+        "a": "Available",
+        "d": "Doubtful",
+        "i": "Injured",
+        "s": "Suspended",
+        "u": "Unavailable",
+        "n": "Not in Squad"
+    }
+
+    players_df["status_readable"] = players_df["status"].map(status_map)
+
+    # --- Injury table ---
+    injuries_df = (
+        players_df
+        .query("status not in ['a','u','n']")
+        [["name", "team", "position_name", "status_readable", "news", "chance_of_playing_this_round"]]
+        .sort_values(["team", "chance_of_playing_this_round"])
+    )
+
+    # --- SAVE ---
+    if save:
+        input_path = Path("./input")
+        input_path.mkdir(exist_ok=True)
+
+        players_df.to_parquet(input_path / "players.parquet", index=False)
+        injuries_df.to_parquet(input_path / "injuries.parquet", index=False)
+        teams_df.to_parquet(input_path / "teams.parquet", index=False)
+
+    return players_df, injuries_df, data['element_types']
 
 
+
+##################
+###Optimazation###
+##################
 # ── Forecast ───────────────────────────────────────────────────────────────────
 
 def fetch_and_forecast_players() -> pd.DataFrame:
@@ -292,7 +330,7 @@ def run_and_save_base_optimization(output_path: str = "base_squad_result.csv") -
     selected_df["in_starting_11"] = selected_df["name"].isin(starting_11["name"])
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    selected_df.to_csv(output_path, index=False)
+    selected_df.to_parquet(output_path, index=False)
 
     log.info(f"✅ Status     : {LpStatus[model.status]}")
     log.info(f"💾 Saved to   : {output_path}")
@@ -305,5 +343,5 @@ def run_and_save_base_optimization(output_path: str = "base_squad_result.csv") -
 
 
 if __name__ == "__main__":
-    load_fpl_data(save=True)
+    download_fpl_data(save=True)
     run_and_save_base_optimization("./input/base_squad_result.parquet")

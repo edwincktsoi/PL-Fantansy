@@ -6,6 +6,7 @@ from pulp import LpStatus
 import plotly.express as px
 import plotly.graph_objects as go
 import time 
+from pathlib import Path
 
 # --- 1. CONFIG & SETUP ---
 st.set_page_config(
@@ -663,16 +664,254 @@ with st.sidebar:
         st.info("📊 Run optimization to see stats")
 
 # --- MAIN CONTENT ---
-tab_analytics, tab_recruit_perf, tab5, tab4 = st.tabs([
+tab_sporting_dir, tab_analytics, tab_recruit_perf, tab5, tab4 = st.tabs([
+    "🏆 Manager Recomendation",
     "📊 Analytics Hub",
     "🧠 Recruitment & Performance",
     "🏥 Medical & Sports Science",
-    "🔬 AI Assistant Manager",
+    "🔬 Meeting with Assistant Manager",
 ])
 
+# ── TAB: SPORTING DIRECTOR ────────────────────────────────────────────────────
+with tab_sporting_dir:
+    st.markdown("## 🏆 Sporting Director")
+    st.caption("Pre-computed optimal squad — unconstrained, pure AI selection")
 
+    BASELINE_PATH = Path("./input/base_squad_result.parquet")
+
+    # ── Load & validate ────────────────────────────────────────────────────
+    if not BASELINE_PATH.exists():
+        st.markdown("""
+            <div class='warning-banner'>
+                <h3 style='margin:0; color:#856404;'>⚠️ No Baseline Squad Found</h3>
+                <p style='margin:0.5rem 0 0 0;'>
+                    Run <code>run_and_save_base_optimization()</code> from the backend
+                    to generate <code>./input/base_squad_result.parquet</code>.
+                </p>
+            </div>
+        """, unsafe_allow_html=True)
+        st.stop()
+
+    @st.cache_data(ttl=3600, show_spinner="Loading baseline squad...")
+    def load_baseline(path: str) -> pd.DataFrame:
+        df = pd.read_parquet(path)
+        if "position_name" not in df.columns:
+            df["position_name"] = df["element_type"].map({1:"GKP",2:"DEF",3:"MID",4:"FWD"})
+        return df
+
+    baseline_df    = load_baseline(str(BASELINE_PATH))
+    baseline_xi    = baseline_df[baseline_df["in_starting_11"] == True].copy()
+    baseline_bench = baseline_df[baseline_df["in_starting_11"] == False].copy()
+
+    # ── Header row: file freshness + refresh ──────────────────────────────
+    mtime = pd.Timestamp(BASELINE_PATH.stat().st_mtime, unit="s").strftime("%d %b %Y, %H:%M")
+    hcol1, hcol2 = st.columns([4, 1])
+    with hcol1:
+        st.caption(f"📅 Last generated: **{mtime}**")
+    with hcol2:
+        if st.button("🔄 Refresh Data", use_container_width=True, key="sd_refresh"):
+            st.cache_data.clear()
+            st.rerun()
+
+    # ── Squad summary metrics ──────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("## 📊 Squad Summary")
+
+    counts        = baseline_xi["position_name"].value_counts()
+    formation_str = f"{counts.get('DEF',0)}-{counts.get('MID',0)}-{counts.get('FWD',0)}"
+    budget_remain = 100.0 - baseline_df["now_cost"].sum()
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    for col, val, label in [
+        (c1, f"£{baseline_df['now_cost'].sum():.1f}",       "Squad Cost"),
+        (c2, f"£{budget_remain:.1f}",                        "Remaining"),
+        (c3, f"{baseline_df['projected_points'].sum():.0f}",  "Total Pts"),
+        (c4, f"{baseline_xi['projected_points'].sum():.0f}",  "XI Pts"),
+        (c5, formation_str,                                    "Formation"),
+        (c6, f"{len(baseline_df)}/15",                        "Squad Size"),
+    ]:
+        with col:
+            st.markdown(f"""
+                <div class='stat-card'>
+                    <div class='stat-value'>{val}</div>
+                    <div class='stat-label'>{label}</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+    # ── Pitch ──────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("## ⚽ Starting XI")
+    st.plotly_chart(
+        create_pitch_visualization(baseline_df, baseline_xi),
+        use_container_width=True,key="sd_pitch_1"
+    )
+
+    # ── Captain picks ──────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("## 🔴 Captain Recommendations")
+    st.caption("Top performers from the unconstrained optimal XI")
+
+    top_5 = baseline_xi.sort_values("projected_points", ascending=False).head(5)
+    cap_col1, cap_col2 = st.columns([2, 1])
+
+    with cap_col1:
+        st.markdown("##### 🏆 Top 5 Picks")
+        BADGES = [
+            ("🥇", "linear-gradient(135deg, #ffd700 0%, #ffed4e 100%)"),
+            ("🥈", "linear-gradient(135deg, #e8e8e8 0%, #f5f5f5 100%)"),
+            ("🥉", "linear-gradient(135deg, #cd7f32 0%, #e8a87c 100%)"),
+            ("⭐", "white"),
+            ("⭐", "white"),
+        ]
+        for idx, (_, row) in enumerate(top_5.iterrows()):
+            badge, bg = BADGES[idx]
+            double_pts = float(row["projected_points"]) * 2
+            st.markdown(f"""
+                <div class='modern-card' style='background:{bg}; margin-bottom:0.8rem;'>
+                    <div style='display:flex; justify-content:space-between; align-items:center;'>
+                        <div>
+                            <span style='font-size:1.5rem;'>{badge}</span>
+                            <strong style='font-size:1.1rem; color:#37003c;'> {row['name']}</strong>
+                            <span style='color:#666; margin-left:0.5rem;'>
+                                ({row['position_name']} · {row['team']})
+                            </span>
+                        </div>
+                        <div style='text-align:right;'>
+                            <div style='font-size:1.3rem; font-weight:700; color:#28a745;'>{double_pts:.1f} pts</div>
+                            <div style='font-size:0.85rem; color:#666;'>with captaincy</div>
+                        </div>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
+    with cap_col2:
+        st.markdown("##### 💡 About This Squad")
+        st.markdown("""
+            <div class='info-banner'>
+                <strong>Sporting Director mode:</strong>
+                <ul style='margin:0.5rem 0; padding-left:1.5rem;'>
+                    <li>No forced inclusions</li>
+                    <li>No exclusions applied</li>
+                    <li>Pure LP optimisation</li>
+                    <li>Max value within £100m</li>
+                </ul>
+                <strong>Use as your benchmark</strong> — compare against your
+                constrained squad in the Recruitment Hub to see the true cost
+                of your preferences.
+            </div>
+        """, unsafe_allow_html=True)
+
+    # ── Bench ──────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("## 🪑 Bench")
+    st.caption("Ordered by projected points — GK always last")
+
+    outfield_bench = (
+        baseline_bench[baseline_bench["position_name"] != "GKP"]
+        .sort_values("projected_points", ascending=False)
+    )
+    gk_bench    = baseline_bench[baseline_bench["position_name"] == "GKP"]
+    final_bench = pd.concat([outfield_bench, gk_bench]).reset_index(drop=True)
+
+    bench_cols = st.columns(4)
+    for i, (_, p) in enumerate(final_bench.iterrows()):
+        with bench_cols[i % 4]:
+            rank_label = f"#{i+1}" if p["position_name"] != "GKP" else "GK"
+            st.markdown(f"""
+                <div class='bench-player-card'>
+                    <div style='position:absolute; top:1rem; right:1rem;
+                                font-weight:700; color:#37003c;'>{rank_label}</div>
+                    <div style='font-weight:700; font-size:1.2rem;
+                                color:#37003c; margin-bottom:0.5rem;'>
+                        {p['name'].split()[-1]}
+                    </div>
+                    <div style='font-size:0.9rem; color:#6c757d;'>
+                        {p['position_name']} | {p['team']}
+                    </div>
+                    <div style='margin-top:1rem; padding-top:1rem; border-top:2px solid #e8eaed;'>
+                        <span style='font-weight:700; font-size:1.1rem; color:#28a745;'>
+                            {p['projected_points']:.1f} pts
+                        </span>
+                        <span style='color:#6c757d;'> | £{p['now_cost']:.1f}m</span>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
+    # ── Full squad table ───────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("## 📋 Full Squad Breakdown")
+
+    DISPLAY_COL_MAP = {
+        "name": "web_name", "position_name": "Position", "team": "Team",
+        "now_cost": "Cost (£m)", "projected_points": "Proj. Points",
+        "fixture_multiplier": "Fixture", "form": "Form",
+        "gw_1_points": "GW-1", "gw_2_points": "GW-2", "gw_3_points": "GW-3",
+        "in_starting_11": "Starting XI",
+    }
+    available_cols = [c for c in DISPLAY_COL_MAP if c in baseline_df.columns]
+    display_df = (
+        baseline_df[available_cols]
+        .sort_values([ "projected_points"], ascending=[False])
+        .rename(columns=DISPLAY_COL_MAP)
+    )
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Cost (£m)":    st.column_config.NumberColumn(format="£%.1f"),
+            "Proj. Points": st.column_config.NumberColumn(format="%.1f"),
+            "Fixture":      st.column_config.NumberColumn(format="%.2f"),
+            "Form":         st.column_config.NumberColumn(format="%.1f"),
+            "GW-1":         st.column_config.NumberColumn(format="%.0f"),
+            "GW-2":         st.column_config.NumberColumn(format="%.0f"),
+            "GW-3":         st.column_config.NumberColumn(format="%.0f"),
+            "Starting XI":  st.column_config.CheckboxColumn(),
+        },
+    )
+
+    # ── Distribution analysis ──────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("## ⚽ Squad Distribution")
+
+    d1, d2, d3 = st.columns(3)
+
+    with d1:
+        st.markdown("**📊 By Position**")
+        for pos in ["GKP", "DEF", "MID", "FWD"]:
+            count = (baseline_df["position_name"] == pos).sum()
+            st.markdown(f"""
+                <div class='stat-card' style='margin-bottom:0.8rem;'>
+                    <div class='stat-value'>{count}</div>
+                    <div class='stat-label'>{pos}</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+    with d2:
+        st.markdown("**🏟️ By Team**")
+        for team, count in baseline_df["team"].value_counts().items():
+            st.markdown(f"""
+                <div class='modern-card' style='padding:0.8rem; margin-bottom:0.5rem;'>
+                    <strong style='color:#37003c;'>{team}</strong>: {count} player(s)
+                </div>
+            """, unsafe_allow_html=True)
+
+    with d3:
+        st.markdown("**💰 Cost Breakdown**")
+        for pos in ["GKP", "DEF", "MID", "FWD"]:
+            pos_cost = baseline_df[baseline_df["position_name"] == pos]["now_cost"].sum()
+            st.markdown(f"""
+                <div class='modern-card' style='padding:0.8rem; margin-bottom:0.5rem;'>
+                    <strong style='color:#37003c;'>{pos}</strong>: £{pos_cost:.1f}m
+                </div>
+            """, unsafe_allow_html=True)
+        st.markdown(f"""
+            <div class='stat-card' style='margin-top:0.5rem;'>
+                <div class='stat-value'>£{budget_remain:.1f}m</div>
+                <div class='stat-label'>ITB Remaining</div>
+            </div>
+        """, unsafe_allow_html=True)
  
-# --- SIDEBAR ---
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("🎯 Squad Discovery")
@@ -793,7 +1032,7 @@ with tab_analytics:
         tot_cols[3].markdown(f"**{int(squad_data['total_points'].sum())}**")
         tot_cols[4].markdown(f"**£{squad_data['now_cost'].sum():.1f}m**")
         with tot_cols[5]:
-            if st.button("🗑️ Clear all", key="clear_all_squad", type="secondary"):
+            if st.button("🗑️ Clear all", key="clear_all_squad_1", type="secondary"):
                 st.session_state.my_squad_names = []
                 st.session_state.comparison_list = []
                 st.rerun()
@@ -961,7 +1200,7 @@ with tab_recruit_perf:
             """, unsafe_allow_html=True)
         with m3:
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("🗑️ Reset All", use_container_width=True, key="recruit_reset"):
+            if st.button("🗑️ Reset All", use_container_width=True, key="recruit_reset_1"):
                 st.session_state.players_to_keep = []
                 st.session_state.players_to_exclude = []
                 st.rerun()
@@ -980,15 +1219,15 @@ with tab_recruit_perf:
                 </div>
             """, unsafe_allow_html=True)
 
-            sel_team_inc = st.selectbox("Select Team", [""] + teams_list, key="inc_team")
+            sel_team_inc = st.selectbox("Select Team", [""] + teams_list, key="inc_team_1")
             if sel_team_inc:
                 team_p = players_df[players_df['team'] == sel_team_inc].sort_values('web_name')
                 p_options = [
                     f"{row['web_name']} ({row['position_name']} - £{row['now_cost']:.1f}m)"
                     for _, row in team_p.iterrows()
                 ]
-                selected = st.multiselect("Choose Players", options=p_options, key="inc_p_multi")
-                if st.button("➕ Add to Squad", key="btn_add_inc", use_container_width=True):
+                selected = st.multiselect("Choose Players", options=p_options, key="inc_p_multi_1")
+                if st.button("➕ Add to Squad", key="btn_add_inc_1", use_container_width=True):
                     for item in selected:
                         p_web_name = item.split(" (")[0]
                         full_name = team_p[team_p['web_name'] == p_web_name]['name'].values[0]
@@ -1008,7 +1247,7 @@ with tab_recruit_perf:
                             </div>
                         """, unsafe_allow_html=True)
                     with col_b:
-                        if st.button("✕", key=f"del_inc_{p_name}"):
+                        if st.button("✕", key=f"del_inc_{p_name}_1"):
                             st.session_state.players_to_keep.remove(p_name)
                             st.rerun()
 
@@ -1021,15 +1260,15 @@ with tab_recruit_perf:
                 </div>
             """, unsafe_allow_html=True)
 
-            sel_team_exc = st.selectbox("Select Team", [""] + teams_list, key="exc_team")
+            sel_team_exc = st.selectbox("Select Team", [""] + teams_list, key="exc_team_1")
             if sel_team_exc:
                 team_p = players_df[players_df['team'] == sel_team_exc].sort_values('web_name')
                 p_options = [
                     f"{row['web_name']} ({row['position_name']} - £{row['now_cost']:.1f}m)"
                     for _, row in team_p.iterrows()
                 ]
-                selected = st.multiselect("Choose Players", options=p_options, key="exc_p_multi")
-                if st.button("➕ Add to Exclusions", key="btn_add_exc", use_container_width=True):
+                selected = st.multiselect("Choose Players", options=p_options, key="exc_p_multi_1")
+                if st.button("➕ Add to Exclusions", key="btn_add_exc_1", use_container_width=True):
                     for item in selected:
                         p_web_name = item.split(" (")[0]
                         full_name = team_p[team_p['web_name'] == p_web_name]['name'].values[0]
@@ -1049,7 +1288,7 @@ with tab_recruit_perf:
                             </div>
                         """, unsafe_allow_html=True)
                     with col_b:
-                        if st.button("✕", key=f"del_exc_{p_name}"):
+                        if st.button("✕", key=f"del_exc_{p_name}_1"):
                             st.session_state.players_to_exclude.remove(p_name)
                             st.rerun()
 
