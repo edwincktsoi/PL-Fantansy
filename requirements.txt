@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+requests
+plotly
+pulp
+tqdm
+pyarrow
+langchain
+langchain-google-genai
+langchain-community
